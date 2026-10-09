@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- An orange. Drawn inside the adaptive-icon safe zone (a 66dp circle centred in 108dp). -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- body -->
+    <path
+        android:fillColor="#FF8A1F"
+        android:pathData="M31,59a23,23 0,1 0,46 0a23,23 0,1 0,-46 0z" />
+    <!-- shade -->
+    <path
+        android:fillColor="#E86F0C"
+        android:pathData="M77,59A23,23 0,0 1,31 59A25,25 0,0 0,77 59Z" />
+    <!-- highlight -->
+    <group
+        android:pivotX="45"
+        android:pivotY="50"
+        android:rotation="-35">
+        <path
+            android:fillColor="#FFB866"
+            android:pathData="M39,50a6,4 0,1 0,12 0a6,4 0,1 0,-12 0z" />
+    </group>
+    <!-- dimples -->
+    <path
+        android:fillColor="#E8780F"
+        android:pathData="M59.1,52a0.9,0.9 0,1 0,1.8 0a0.9,0.9 0,1 0,-1.8 0z M65.1,62a0.9,0.9 0,1 0,1.8 0a0.9,0.9 0,1 0,-1.8 0z M51.1,68a0.9,0.9 0,1 0,1.8 0a0.9,0.9 0,1 0,-1.8 0z M43.1,62a0.9,0.9 0,1 0,1.8 0a0.9,0.9 0,1 0,-1.8 0z" />
+    <!-- stem -->
+    <path
+        android:fillColor="#6B4423"
+        android:pathData="M52.6,31h2.8v6.5h-2.8z" />
+    <!-- leaf -->
+    <path
+        android:fillColor="#3FA34D"
+        android:pathData="M55.5,35C58,28 64,25 71,26.5C69,33 63,36.5 55.5,35Z" />
+    <path
+        android:pathData="M57,34C61.5,32 65,30 69.5,27.5"
+        android:strokeWidth="1"
+        android:strokeColor="#2E7D3A"
+        android:strokeLineCap="round" />
+</vector>

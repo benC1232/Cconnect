@@ -1,0 +1,25 @@
+# Gradle / build output
+.gradle/
+.kotlin/
+build/
+/captures
+.externalNativeBuild
+.cxx
+*.apk
+*.aab
+
+# Machine-specific (contains your local SDK path)
+/local.properties
+
+# Signing keys
+*.jks
+*.keystore
+
+# Android Studio (keep only the shared run configuration)
+*.iml
+.idea/*
+!.idea/runConfigurations/
+
+# OS
+.DS_Store
+Thumbs.db
