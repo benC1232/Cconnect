@@ -10,6 +10,7 @@ import com.cconnect.app.ssh.HostKeyStore
 import com.cconnect.app.ssh.KeyManager
 import com.cconnect.app.ssh.SshManager
 import com.cconnect.app.ssh.SshManager.Companion.shellQuote
+import net.schmizz.sshj.userauth.UserAuthException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -37,7 +38,14 @@ data class ClaudeSession(
     val needsTrust: Boolean = false,
     /** The login shell is stuck on oh-my-zsh's "Would you like to update?" question, before claude starts. */
     val needsZshUpdateAnswer: Boolean = false,
+    /** Claude isn't logged in to a claude.ai account, so Remote Control can't start. */
+    val needsLogin: Boolean = false,
+    /** /login is waiting for the code from the browser; this is its sign-in link. */
+    val pendingLoginUrl: String? = null,
 )
+
+/** Logging Claude in from the app. [url] is set once /login is showing its sign-in link. */
+data class LoginPrompt(val session: ClaudeSession, val url: String? = null, val submitting: Boolean = false)
 
 /** Why a session exited: its last lines of output. */
 data class SessionExit(val session: ClaudeSession, val output: String)
@@ -63,6 +71,9 @@ data class UiState(
     val sessionExit: SessionExit? = null,
     val trustPrompt: ClaudeSession? = null,
     val zshUpdatePrompt: ClaudeSession? = null,
+    val loginPrompt: LoginPrompt? = null,
+    /** The SSH connection dropped (e.g. while the app was in the background) and is being re-established. */
+    val reconnecting: Boolean = false,
     val openUrl: String? = null,
 )
 
@@ -70,11 +81,21 @@ const val CLAUDE_COMMAND = "claude --remote-control"
 private const val SESSION_PREFIX = "claude-"
 private const val MAX_RECENT_LOGINS = 5
 private const val POLL_INTERVAL_MS = 5_000L
+private const val RECONNECT_ATTEMPTS = 36
+private const val RECONNECT_DELAY_MS = 5_000L // with 36 attempts, keeps trying for about 3 minutes
 private val URL = Regex("""https://\S+""")
 /** Claude's "do you trust this folder?" prompt, shown on the first run in a folder. */
 private val TRUST_PROMPT = Regex("""(?i)Yes, I trust this folder|Do you trust the files in this folder""")
 /** oh-my-zsh's update question, asked by the interactive login shell before claude starts. */
 private val ZSH_UPDATE_PROMPT = Regex("""(?i)\[oh-my-zsh] Would you like to update\? \[Y/n]\s*$""")
+/** Claude's status line when no account is logged in. */
+private val NOT_LOGGED_IN = Regex("""Not logged in\s*·\s*Run /login""")
+/** The /login menu option for a claude.ai account (the only kind that supports Remote Control). */
+private val LOGIN_SUBSCRIPTION_OPTION = Regex("""Claude account with subscription""")
+/** Shown under the sign-in link while /login waits for the code from the browser. */
+private val LOGIN_CODE_PROMPT = Regex("""Paste code here""")
+private val LOGIN_SUCCESS = Regex("""(?i)Login successful""")
+private val LOGIN_CONTINUE = Regex("""(?i)Press Enter to continue""")
 private val YES_OPTION = Regex("""^\s*(\u276F\s*)?Yes\b""")
 private const val MENU_CURSOR = "\u276F" // ❯, marks the selected option in Claude's menus
 private const val PANE_SEPARATOR = "@@cconnect-pane@@"
@@ -99,6 +120,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     private val trustPrompted = mutableSetOf<String>()
     /** Sessions whose oh-my-zsh update question was already shown. */
     private val zshUpdatePrompted = mutableSetOf<String>()
+    /** Sessions whose "not logged in" dialog was already shown. */
+    private val loginPrompted = mutableSetOf<String>()
 
     init {
         viewModelScope.launch(Dispatchers.IO) {
@@ -217,12 +240,42 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         pollJob = viewModelScope.launch(Dispatchers.IO) {
             while (isActive) {
                 loadSessions()
-                if (!ssh.isConnected) {
+                if (!ssh.isConnected && !reconnect()) {
                     disconnectLost()
                     break
                 }
                 delay(POLL_INTERVAL_MS)
             }
+        }
+    }
+
+    /**
+     * Re-establishes a dropped connection with this phone's key, keeping the screen and any open
+     * dialog as they are. Android cuts background apps off the network, so this happens whenever
+     * the user leaves the app for a while (e.g. to sign in in the browser). Network errors are
+     * retried for a few minutes; a rejected key or changed host key gives up right away.
+     */
+    private suspend fun reconnect(): Boolean {
+        val s = _state.value
+        val (host, port) = parseHost(s.host.trim()) ?: return false
+        _state.update { it.copy(reconnecting = true) }
+        try {
+            repeat(RECONNECT_ATTEMPTS) { attempt ->
+                try {
+                    ssh.connect(host, port, s.user.trim(), null)
+                    loadSessions()
+                    return true
+                } catch (e: HostKeyMismatchException) {
+                    return false
+                } catch (e: UserAuthException) {
+                    return false
+                } catch (e: Exception) {
+                    if (attempt < RECONNECT_ATTEMPTS - 1) delay(RECONNECT_DELAY_MS)
+                }
+            }
+            return false
+        } finally {
+            _state.update { it.copy(reconnecting = false) }
         }
     }
 
@@ -243,6 +296,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             .let(::markPrompts)
         val newPrompt = sessions.firstOrNull { it.needsTrust && trustPrompted.add(it.name) }
         val newZshPrompt = sessions.firstOrNull { it.needsZshUpdateAnswer && zshUpdatePrompted.add(it.name) }
+        val newLogin = sessions.firstOrNull { it.needsLogin && loginPrompted.add(it.name) }
         _state.update { s ->
             s.copy(
                 sessions = sessions,
@@ -250,6 +304,13 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 trustPrompt = newPrompt ?: s.trustPrompt?.takeIf { p -> sessions.any { it.name == p.name && it.needsTrust } },
                 zshUpdatePrompt = newZshPrompt
                     ?: s.zshUpdatePrompt?.takeIf { p -> sessions.any { it.name == p.name && it.needsZshUpdateAnswer } },
+                // Once /login is underway the "not logged in" line is gone, so keep a prompt that has its link.
+                loginPrompt = s.loginPrompt?.takeIf { p ->
+                    sessions.any { it.name == p.session.name && it.running && (p.url != null || it.needsLogin) }
+                }
+                    // A /login already waiting for its code (e.g. the app restarted mid-login): pick it back up.
+                    ?: sessions.firstOrNull { it.pendingLoginUrl != null }?.let { LoginPrompt(it, it.pendingLoginUrl) }
+                    ?: newLogin?.let { LoginPrompt(it) },
             )
         }
     }
@@ -268,6 +329,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             s.copy(
                 needsTrust = screen.contains(TRUST_PROMPT),
                 needsZshUpdateAnswer = screen.isWaitingForZshUpdate(),
+                needsLogin = screen.contains(NOT_LOGGED_IN),
+                pendingLoginUrl = if (screen.contains(LOGIN_CODE_PROMPT)) extractLoginUrl(screen) else null,
             )
         }
     }
@@ -305,12 +368,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         _state.update { it.copy(trustPrompt = null, busy = true) }
         try {
             val t = shellQuote(session.name)
-            val lines = ssh.exec("tmux capture-pane -p -J -t $t").stdout.lines()
-            val cursor = lines.indexOfFirst { it.trimStart().startsWith(MENU_CURSOR) }
-            val yes = lines.indexOfFirst { YES_OPTION.containsMatchIn(it) }
-            if (cursor < 0 || yes < 0) error("Couldn't find the trust question on the session's screen.")
-            val moves = List(kotlin.math.abs(yes - cursor)) { if (yes > cursor) "Down" else "Up" }
-            ssh.exec("tmux send-keys -t $t ${(moves + "Enter").joinToString(" ")}")
+            if (!selectMenuOption(t, YES_OPTION)) error("Couldn't find the trust question on the session's screen.")
             delay(1_500)
             val after = ssh.exec("tmux capture-pane -p -J -t $t").stdout
             if (after.contains(TRUST_PROMPT)) error("Claude is still asking. Try again.")
@@ -324,6 +382,99 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     fun dismissTrustPrompt() = _state.update { it.copy(trustPrompt = null) }
 
+    /**
+     * Moves the cursor in one of Claude's menus onto the line matching [option] and presses Enter.
+     * The cursor may start on any option. Returns false if the menu or option isn't on screen.
+     */
+    private fun selectMenuOption(t: String, option: Regex): Boolean {
+        val lines = ssh.exec("tmux capture-pane -p -J -t $t").stdout.lines()
+        val cursor = lines.indexOfFirst { it.trimStart().startsWith(MENU_CURSOR) }
+        val target = lines.indexOfFirst { option.containsMatchIn(it) }
+        if (cursor < 0 || target < 0) return false
+        val moves = List(kotlin.math.abs(target - cursor)) { if (target > cursor) "Down" else "Up" }
+        ssh.exec("tmux send-keys -t $t ${(moves + "Enter").joinToString(" ")}")
+        return true
+    }
+
+    /** Polls the session's screen until [done] matches it, or fails after [timeoutMs]. */
+    private suspend fun waitForScreen(t: String, timeoutMs: Long, what: String, done: (String) -> Boolean): String {
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (true) {
+            val screen = ssh.exec("tmux capture-pane -p -J -t $t").stdout
+            if (done(screen)) return screen
+            if (System.currentTimeMillis() > deadline) error("Timed out waiting for $what.")
+            delay(700)
+        }
+    }
+
+    // ---- Logging Claude in ----
+
+    /**
+     * Runs /login in the session, picks the claude.ai account option and reads the sign-in link off
+     * the screen. The user then signs in on their phone and pastes the code back ([submitLoginCode]).
+     */
+    fun startLogin(session: ClaudeSession) = io {
+        _state.update { it.copy(busy = true) }
+        try {
+            val t = shellQuote(session.name)
+            ssh.exec("tmux send-keys -t $t -l /login")
+            delay(500) // let the slash-command menu settle before Enter
+            ssh.exec("tmux send-keys -t $t Enter")
+            val menu = waitForScreen(t, 10_000, "the login menu") {
+                it.contains(LOGIN_SUBSCRIPTION_OPTION) || it.contains(LOGIN_CODE_PROMPT)
+            }
+            if (!menu.contains(LOGIN_CODE_PROMPT) && !selectMenuOption(t, LOGIN_SUBSCRIPTION_OPTION)) {
+                error("Couldn't find the Claude account option in the login menu.")
+            }
+            val screen = waitForScreen(t, 15_000, "the sign-in link") {
+                it.contains(LOGIN_CODE_PROMPT) && extractLoginUrl(it) != null
+            }
+            val url = extractLoginUrl(screen)!!
+            _state.update { it.copy(loginPrompt = LoginPrompt(session, url)) }
+        } catch (e: Exception) {
+            _state.update { it.copy(loginPrompt = null, message = "Couldn't start login: ${describe(e)}") }
+        } finally {
+            _state.update { it.copy(busy = false) }
+        }
+    }
+
+    /** Pastes the code from the browser into /login and confirms the result. */
+    fun submitLoginCode(session: ClaudeSession, code: String) = io {
+        _state.update { s -> s.copy(loginPrompt = s.loginPrompt?.copy(submitting = true), busy = true) }
+        try {
+            val t = shellQuote(session.name)
+            ssh.exec("tmux send-keys -t $t -l ${shellQuote(code.trim())}")
+            ssh.exec("tmux send-keys -t $t Enter")
+            val screen = waitForScreen(t, 30_000, "Claude to confirm the login") {
+                it.contains(LOGIN_SUCCESS) || !it.contains(LOGIN_CODE_PROMPT)
+            }
+            if (!screen.contains(LOGIN_SUCCESS)) {
+                val tail = screen.lines().filter { it.isNotBlank() }.takeLast(4).joinToString(" ") { it.trim() }
+                error(tail.ifBlank { "Claude didn't accept the code." })
+            }
+            if (screen.contains(LOGIN_CONTINUE)) ssh.exec("tmux send-keys -t $t Enter")
+            loginPrompted.remove(session.name)
+            // --remote-control is only read at startup, so this session stays without a link.
+            _state.update {
+                it.copy(loginPrompt = null, message = "Logged in. Close this session and start a new one to use Remote Control.")
+            }
+        } catch (e: Exception) {
+            _state.update { s ->
+                s.copy(loginPrompt = s.loginPrompt?.copy(submitting = false), message = "Login failed: ${describe(e)}")
+            }
+        } finally {
+            _state.update { it.copy(busy = false) }
+        }
+        loadSessions()
+    }
+
+    /** Closes the login dialog, backing out of /login if it was already showing its link. */
+    fun cancelLogin(session: ClaudeSession) = io {
+        val inProgress = _state.value.loginPrompt?.url != null
+        _state.update { it.copy(loginPrompt = null) }
+        if (inProgress) runCatching { ssh.exec("tmux send-keys -t ${shellQuote(session.name)} Escape") }
+    }
+
     /** Tapping a session: open its remote-control link, or explain why it exited. */
     fun openSession(session: ClaudeSession) = io {
         val output = runCatching {
@@ -332,6 +483,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         when {
             session.needsTrust -> _state.update { it.copy(trustPrompt = session) }
             session.needsZshUpdateAnswer -> _state.update { it.copy(zshUpdatePrompt = session) }
+            session.needsLogin -> _state.update { it.copy(loginPrompt = LoginPrompt(session)) }
+            _state.value.loginPrompt?.session?.name == session.name -> Unit // its login dialog is already open
             !session.running ->
                 _state.update { it.copy(sessionExit = SessionExit(session, output.trimEnd().lines().takeLast(30).joinToString("\n"))) }
             else -> {
@@ -351,7 +504,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         runCatching { ssh.exec("tmux kill-session -t ${shellQuote(session.name)}") }
             .onFailure { e -> _state.update { it.copy(message = "Couldn't close: ${describe(e)}") } }
         _state.update { s ->
-            s.copy(sessions = s.sessions.filter { it.name != session.name }, sessionExit = null, trustPrompt = null, zshUpdatePrompt = null)
+            s.copy(sessions = s.sessions.filter { it.name != session.name }, sessionExit = null, trustPrompt = null, zshUpdatePrompt = null,
+                loginPrompt = s.loginPrompt?.takeIf { it.session.name != session.name })
         }
         loadSessions()
     }
@@ -467,6 +621,22 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 return input.substringBefore(':') to port
             }
             return input to 22
+        }
+
+        /**
+         * Reads /login's sign-in link off the screen. Claude hard-wraps it at the pane width, so the
+         * continuation lines (which start at column 0, unlike the indented UI text) are joined back on.
+         */
+        fun extractLoginUrl(screen: String): String? {
+            val lines = screen.lines()
+            val start = lines.indexOfFirst { it.trimStart().startsWith("https://") && "oauth" in it }
+            if (start < 0) return null
+            val url = StringBuilder(lines[start].trim())
+            for (line in lines.drop(start + 1)) {
+                if (line.isBlank() || line.first().isWhitespace()) break
+                url.append(line.trimEnd())
+            }
+            return url.toString()
         }
 
         fun describe(e: Throwable): String {

@@ -16,6 +16,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Logout
+import androidx.compose.material.icons.automirrored.filled.OpenInNew
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.ErrorOutline
@@ -33,6 +34,8 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.ListItem
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
@@ -44,6 +47,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -84,7 +88,7 @@ fun SessionsScreen(state: UiState, vm: MainViewModel) {
                     Column {
                         Text("Claude sessions", style = MaterialTheme.typography.titleMedium)
                         Text(
-                            "${state.user}@${state.host}",
+                            if (state.reconnecting) "Reconnecting…" else "${state.user}@${state.host}",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
@@ -185,6 +189,63 @@ fun SessionsScreen(state: UiState, vm: MainViewModel) {
         )
     }
 
+    state.loginPrompt?.let { prompt ->
+        val session = prompt.session
+        val url = prompt.url
+        if (url == null) {
+            AlertDialog(
+                onDismissRequest = { vm.cancelLogin(session) },
+                title = { Text("Log in to Claude?") },
+                text = {
+                    Text(
+                        "Claude isn't logged in on ${state.host}, so Remote Control can't start. " +
+                            "Log in with your Claude account from here."
+                    )
+                },
+                confirmButton = {
+                    TextButton(onClick = { vm.startLogin(session) }, enabled = !state.busy) { Text("Log in") }
+                },
+                dismissButton = { TextButton(onClick = { vm.cancelLogin(session) }) { Text("Not now") } },
+            )
+        } else {
+            var code by rememberSaveable(url) { mutableStateOf("") }
+            AlertDialog(
+                onDismissRequest = {}, // keep it open while the user is in the browser
+                title = { Text("Log in to Claude") },
+                text = {
+                    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                        Text("1. Open the login page and sign in with your Claude account.")
+                        OutlinedButton(
+                            onClick = { runCatching { uriHandler.openUri(url) } },
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            Icon(Icons.AutoMirrored.Filled.OpenInNew, null)
+                            Text("Open login page", Modifier.padding(start = 8.dp))
+                        }
+                        Text("2. Copy the code the page shows and paste it here.")
+                        OutlinedTextField(
+                            value = code,
+                            onValueChange = { code = it },
+                            label = { Text("Code") },
+                            singleLine = true,
+                            enabled = !prompt.submitting,
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                    }
+                },
+                confirmButton = {
+                    TextButton(
+                        onClick = { vm.submitLoginCode(session, code) },
+                        enabled = code.isNotBlank() && !prompt.submitting,
+                    ) { Text(if (prompt.submitting) "Logging in…" else "Log in") }
+                },
+                dismissButton = {
+                    TextButton(onClick = { vm.cancelLogin(session) }, enabled = !prompt.submitting) { Text("Cancel") }
+                },
+            )
+        }
+    }
+
     state.sessionExit?.let { exit ->
         AlertDialog(
             onDismissRequest = vm::dismissSessionExit,
@@ -218,13 +279,15 @@ private fun SessionRow(session: ClaudeSession, onOpen: () -> Unit, onClose: () -
                     !session.running -> "Exited — tap to see why"
                     session.needsTrust -> "Waiting for you to trust this folder — tap"
                     session.needsZshUpdateAnswer -> "oh-my-zsh is asking to update — tap"
+                    session.needsLogin -> "Claude isn't logged in — tap to log in"
                     else -> session.dir
                 },
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
                 color = when {
                     !session.running -> MaterialTheme.colorScheme.error
-                    session.needsTrust || session.needsZshUpdateAnswer -> MaterialTheme.colorScheme.tertiary
+                    session.needsTrust || session.needsZshUpdateAnswer || session.needsLogin ->
+                        MaterialTheme.colorScheme.tertiary
                     else -> MaterialTheme.colorScheme.onSurfaceVariant
                 },
             )
