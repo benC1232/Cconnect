@@ -170,6 +170,21 @@ fun SessionsScreen(state: UiState, vm: MainViewModel) {
         )
     }
 
+    state.zshUpdatePrompt?.let { session ->
+        AlertDialog(
+            onDismissRequest = vm::dismissZshUpdatePrompt,
+            title = { Text("Update oh-my-zsh?") },
+            text = {
+                Text(
+                    "Before Claude starts in ${session.folder}, oh-my-zsh is asking whether to update. " +
+                        "Claude starts once you answer."
+                )
+            },
+            confirmButton = { TextButton(onClick = { vm.answerZshUpdate(session, update = true) }) { Text("Yes") } },
+            dismissButton = { TextButton(onClick = { vm.answerZshUpdate(session, update = false) }) { Text("No") } },
+        )
+    }
+
     state.sessionExit?.let { exit ->
         AlertDialog(
             onDismissRequest = vm::dismissSessionExit,
@@ -202,13 +217,14 @@ private fun SessionRow(session: ClaudeSession, onOpen: () -> Unit, onClose: () -
                 when {
                     !session.running -> "Exited — tap to see why"
                     session.needsTrust -> "Waiting for you to trust this folder — tap"
+                    session.needsZshUpdateAnswer -> "oh-my-zsh is asking to update — tap"
                     else -> session.dir
                 },
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
                 color = when {
                     !session.running -> MaterialTheme.colorScheme.error
-                    session.needsTrust -> MaterialTheme.colorScheme.tertiary
+                    session.needsTrust || session.needsZshUpdateAnswer -> MaterialTheme.colorScheme.tertiary
                     else -> MaterialTheme.colorScheme.onSurfaceVariant
                 },
             )

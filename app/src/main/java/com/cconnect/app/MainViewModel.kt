@@ -30,7 +30,14 @@ data class RecentLogin(val host: String, val user: String) {
 }
 
 /** A Claude session running in tmux on the server. [running] is false once claude has exited. */
-data class ClaudeSession(val name: String, val dir: String, val running: Boolean, val needsTrust: Boolean = false)
+data class ClaudeSession(
+    val name: String,
+    val dir: String,
+    val running: Boolean,
+    val needsTrust: Boolean = false,
+    /** The login shell is stuck on oh-my-zsh's "Would you like to update?" question, before claude starts. */
+    val needsZshUpdateAnswer: Boolean = false,
+)
 
 /** Why a session exited: its last lines of output. */
 data class SessionExit(val session: ClaudeSession, val output: String)
@@ -55,6 +62,7 @@ data class UiState(
     val sessionsLoaded: Boolean = false,
     val sessionExit: SessionExit? = null,
     val trustPrompt: ClaudeSession? = null,
+    val zshUpdatePrompt: ClaudeSession? = null,
     val openUrl: String? = null,
 )
 
@@ -65,6 +73,8 @@ private const val POLL_INTERVAL_MS = 5_000L
 private val URL = Regex("""https://\S+""")
 /** Claude's "do you trust this folder?" prompt, shown on the first run in a folder. */
 private val TRUST_PROMPT = Regex("""(?i)Yes, I trust this folder|Do you trust the files in this folder""")
+/** oh-my-zsh's update question, asked by the interactive login shell before claude starts. */
+private val ZSH_UPDATE_PROMPT = Regex("""(?i)\[oh-my-zsh] Would you like to update\? \[Y/n]\s*$""")
 private val YES_OPTION = Regex("""^\s*(\u276F\s*)?Yes\b""")
 private const val MENU_CURSOR = "\u276F" // ❯, marks the selected option in Claude's menus
 private const val PANE_SEPARATOR = "@@cconnect-pane@@"
@@ -87,6 +97,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     private var pollJob: Job? = null
     /** Sessions whose trust prompt was already shown, so it isn't re-shown on every poll. */
     private val trustPrompted = mutableSetOf<String>()
+    /** Sessions whose oh-my-zsh update question was already shown. */
+    private val zshUpdatePrompted = mutableSetOf<String>()
 
     init {
         viewModelScope.launch(Dispatchers.IO) {
@@ -228,19 +240,22 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             .filter { it.size == 4 && it[0].startsWith(SESSION_PREFIX) }
             .distinctBy { it[0] }
             .map { (name, dead, dir, cwd) -> ClaudeSession(name, dir.ifEmpty { cwd }, running = dead != "1") }
-            .let(::markTrustPrompts)
+            .let(::markPrompts)
         val newPrompt = sessions.firstOrNull { it.needsTrust && trustPrompted.add(it.name) }
+        val newZshPrompt = sessions.firstOrNull { it.needsZshUpdateAnswer && zshUpdatePrompted.add(it.name) }
         _state.update { s ->
             s.copy(
                 sessions = sessions,
                 sessionsLoaded = true,
                 trustPrompt = newPrompt ?: s.trustPrompt?.takeIf { p -> sessions.any { it.name == p.name && it.needsTrust } },
+                zshUpdatePrompt = newZshPrompt
+                    ?: s.zshUpdatePrompt?.takeIf { p -> sessions.any { it.name == p.name && it.needsZshUpdateAnswer } },
             )
         }
     }
 
-    /** Checks the screen of each running session for Claude's trust prompt, in one round trip. */
-    private fun markTrustPrompts(sessions: List<ClaudeSession>): List<ClaudeSession> {
+    /** Checks the screen of each running session for prompts that need an answer, in one round trip. */
+    private fun markPrompts(sessions: List<ClaudeSession>): List<ClaudeSession> {
         val running = sessions.filter { it.running }
         if (running.isEmpty()) return sessions
         val script = running.joinToString("; ") {
@@ -248,8 +263,39 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         }
         val out = runCatching { ssh.exec(script).stdout }.getOrNull() ?: return sessions
         val screens = out.split(PANE_SEPARATOR).drop(1).associate { it.substringBefore('\n') to it.substringAfter('\n') }
-        return sessions.map { it.copy(needsTrust = it.running && screens[it.name]?.contains(TRUST_PROMPT) == true) }
+        return sessions.map { s ->
+            val screen = screens[s.name].takeIf { s.running }.orEmpty()
+            s.copy(
+                needsTrust = screen.contains(TRUST_PROMPT),
+                needsZshUpdateAnswer = screen.isWaitingForZshUpdate(),
+            )
+        }
     }
+
+    /** True only while the question is the last thing on screen, i.e. still unanswered. */
+    private fun String.isWaitingForZshUpdate(): Boolean =
+        lines().lastOrNull { it.isNotBlank() }?.let { ZSH_UPDATE_PROMPT.containsMatchIn(it) } == true
+
+    /** Answers oh-my-zsh's update question; claude starts once the shell continues. */
+    fun answerZshUpdate(session: ClaudeSession, update: Boolean) = io {
+        _state.update { it.copy(zshUpdatePrompt = null, busy = true) }
+        try {
+            val t = shellQuote(session.name)
+            val screen = ssh.exec("tmux capture-pane -p -J -t $t").stdout
+            if (!screen.isWaitingForZshUpdate()) error("The question is no longer on the session's screen.")
+            ssh.exec("tmux send-keys -t $t ${if (update) "y" else "n"} Enter")
+            _state.update {
+                it.copy(message = if (update) "Updating oh-my-zsh, then Claude starts" else "Skipped the update. Claude is starting")
+            }
+        } catch (e: Exception) {
+            _state.update { it.copy(message = "Couldn't answer: ${describe(e)}") }
+        } finally {
+            _state.update { it.copy(busy = false) }
+        }
+        loadSessions()
+    }
+
+    fun dismissZshUpdatePrompt() = _state.update { it.copy(zshUpdatePrompt = null) }
 
     /**
      * Answers the trust prompt with "Yes". The cursor may start on "No, exit", so move it
@@ -285,6 +331,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         }.getOrDefault("")
         when {
             session.needsTrust -> _state.update { it.copy(trustPrompt = session) }
+            session.needsZshUpdateAnswer -> _state.update { it.copy(zshUpdatePrompt = session) }
             !session.running ->
                 _state.update { it.copy(sessionExit = SessionExit(session, output.trimEnd().lines().takeLast(30).joinToString("\n"))) }
             else -> {
@@ -304,7 +351,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         runCatching { ssh.exec("tmux kill-session -t ${shellQuote(session.name)}") }
             .onFailure { e -> _state.update { it.copy(message = "Couldn't close: ${describe(e)}") } }
         _state.update { s ->
-            s.copy(sessions = s.sessions.filter { it.name != session.name }, sessionExit = null, trustPrompt = null)
+            s.copy(sessions = s.sessions.filter { it.name != session.name }, sessionExit = null, trustPrompt = null, zshUpdatePrompt = null)
         }
         loadSessions()
     }
